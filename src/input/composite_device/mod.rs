@@ -11,7 +11,7 @@ use std::{
     error::Error,
 };
 
-use evdev::InputEvent;
+use evdev::{FFEffectData, InputEvent};
 use targets::CompositeDeviceTargets;
 use tokio::{sync::mpsc, task::JoinSet, time::Duration};
 use zbus::{object_server::Interface, Connection};
@@ -68,6 +68,177 @@ pub enum InterceptMode {
     /// send events over dbus instead
     GamepadOnly,
 }
+
+/// Definitions remain owned by the target until its FF_ERASE request arrives.
+#[derive(Debug)]
+struct ForceFeedbackEffect {
+    data: FFEffectData,
+    source_ids: HashMap<String, i16>,
+}
+
+#[derive(Debug)]
+struct ForceFeedbackEffects {
+    available_ids: BTreeSet<i16>,
+    effects: HashMap<i16, ForceFeedbackEffect>,
+}
+
+impl Default for ForceFeedbackEffects {
+    fn default() -> Self {
+        Self {
+            available_ids: (0..64).collect(),
+            effects: HashMap::new(),
+        }
+    }
+}
+
+impl ForceFeedbackEffects {
+    async fn upload_and_reply(
+        &mut self,
+        requested_id: i16,
+        data: FFEffectData,
+        sources: &HashMap<String, SourceDeviceClient>,
+        capabilities: &HashMap<String, HashSet<OutputCapability>>,
+        reply: &std::sync::mpsc::Sender<Option<i16>>,
+    ) {
+        let updating = self.effects.contains_key(&requested_id);
+        let id = self
+            .upload_effect(requested_id, data, sources, capabilities)
+            .await;
+        if reply.send(id).is_err() {
+            log::debug!("FF upload caller disappeared before its response");
+            // A cancelled new upload must not keep a physical slot occupied.
+            if !updating {
+                if let Some(id) = id {
+                    self.erase_effect(id, sources).await;
+                }
+            }
+        }
+    }
+
+    async fn upload_effect(
+        &mut self,
+        requested_id: i16,
+        data: FFEffectData,
+        sources: &HashMap<String, SourceDeviceClient>,
+        capabilities: &HashMap<String, HashSet<OutputCapability>>,
+    ) -> Option<i16> {
+        let updating = self.effects.contains_key(&requested_id);
+        // The kernel has already assigned this target ID. UI_END_FF_UPLOAD
+        // consumes retval only, so choosing another ID would break playback.
+        if !updating && !self.available_ids.contains(&requested_id) {
+            return None;
+        }
+        let id = requested_id;
+        let mut effect = self.effects.remove(&id).unwrap_or(ForceFeedbackEffect {
+            data,
+            source_ids: HashMap::new(),
+        });
+        effect.data = data;
+        for (source_id, source) in sources {
+            if !capabilities.get(source_id).is_some_and(|caps| {
+                caps.contains(&OutputCapability::ForceFeedbackUpload)
+                    || caps.contains(&OutputCapability::ForceFeedback)
+            }) {
+                continue;
+            }
+            if let Some(source_effect_id) = effect.source_ids.get(source_id) {
+                if let Err(e) = source.update_effect(*source_effect_id, data).await {
+                    log::warn!("Failed to update FF effect {id} on {source_id}: {e}");
+                }
+            } else {
+                Self::upload_to_source(&mut effect, source_id, source).await;
+            }
+        }
+        if !updating && effect.source_ids.is_empty() {
+            return None;
+        }
+        // Existing target definitions survive periods with no attached sources.
+        self.available_ids.remove(&id);
+        self.effects.insert(id, effect);
+        Some(id)
+    }
+
+    async fn upload_to_source(
+        effect: &mut ForceFeedbackEffect,
+        source_id: &str,
+        source: &SourceDeviceClient,
+    ) {
+        match source.upload_effect(effect.data).await {
+            Ok(id) if id >= 0 => {
+                effect.source_ids.insert(source_id.to_owned(), id);
+            }
+            Ok(_) => (),
+            Err(e) => log::warn!("Failed to upload FF effect to {source_id}: {e}"),
+        }
+    }
+
+    async fn restore_source(
+        &mut self,
+        source_id: &str,
+        source: &SourceDeviceClient,
+        capabilities: &HashSet<OutputCapability>,
+    ) {
+        if !capabilities.contains(&OutputCapability::ForceFeedbackUpload)
+            && !capabilities.contains(&OutputCapability::ForceFeedback)
+        {
+            return;
+        }
+        for effect in self.effects.values_mut() {
+            if !effect.source_ids.contains_key(source_id) {
+                Self::upload_to_source(effect, source_id, source).await;
+            }
+        }
+    }
+
+    fn remove_source(&mut self, source_id: &str) {
+        for effect in self.effects.values_mut() {
+            effect.source_ids.remove(source_id);
+        }
+    }
+
+    async fn erase_effect(&mut self, id: i16, sources: &HashMap<String, SourceDeviceClient>) {
+        let Some(effect) = self.effects.remove(&id) else {
+            return;
+        };
+        for (source_id, source_effect_id) in effect.source_ids {
+            let Some(source) = sources.get(&source_id) else {
+                continue;
+            };
+            if let Err(e) = source.erase_effect(source_effect_id).await {
+                log::warn!("Failed to erase FF effect {id} on {source_id}: {e}");
+            }
+        }
+        self.available_ids.insert(id);
+    }
+}
+
+async fn detach_source(
+    sources: &mut HashMap<String, SourceDeviceClient>,
+    effects: &mut ForceFeedbackEffects,
+    id: &str,
+    stopped: Option<&SourceDeviceClient>,
+) -> bool {
+    if let Some(stopped) = stopped {
+        // A device path can be reused before the previous reader finishes.
+        // Only its own completion may detach the currently registered source.
+        if !sources
+            .get(id)
+            .is_some_and(|current| current.same_channel(stopped))
+        {
+            return false;
+        }
+    }
+    effects.remove_source(id);
+    if let Some(source) = sources.remove(id) {
+        if let Err(e) = source.stop().await {
+            log::debug!("Source {id} already stopped: {e}");
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests;
 
 /// A [CompositeDevice] represents any number source input devices that
 /// can translate input to any target devices
@@ -141,13 +312,8 @@ pub struct CompositeDevice {
     /// Whether or not force feedback output events should be routed to
     /// supported source devices.
     ff_enabled: bool,
-    /// Set of available Force Feedback effect IDs that are not in use
-    /// TODO: Just use the keys from ff_effect_id_source_map to determine next id
-    ff_effect_ids: BTreeSet<i16>,
-    /// Source devices use their own IDs for uploaded force feedback effects.
-    /// This mapping maps the composite device effect ids to source device effect ids.
-    /// E.g. {3: {"evdev://event0": 6, "evdev://event1": 2}}
-    ff_effect_id_source_map: HashMap<i16, HashMap<String, i16>>,
+    /// Uploaded effects belong to target clients, even while sources reconnect.
+    ff_effects: ForceFeedbackEffects,
     /// List of intercept mode activation Capabilities
     intercept_activation_caps: Vec<Capability>,
     /// Capability to send when intercept mode is activated for the first time.
@@ -207,8 +373,7 @@ impl CompositeDevice {
             source_devices_used: Vec::new(),
             targets: CompositeDeviceTargets::new(conn, dbus_path, tx.into(), manager),
             ff_enabled: true,
-            ff_effect_ids: (0..64).collect(),
-            ff_effect_id_source_map: HashMap::new(),
+            ff_effects: ForceFeedbackEffects::default(),
             intercept_activation_caps: vec![Capability::Gamepad(Gamepad::Button(
                 GamepadButton::Guide,
             ))],
@@ -369,16 +534,16 @@ impl CompositeDevice {
                             log::error!("Failed to add source device: {:?}", e);
                         }
                     }
-                    CompositeCommand::SourceDeviceStopped(device) => {
+                    CompositeCommand::SourceDeviceStopped(device, source) => {
                         log::debug!("Detected source device stopped: {}", device.path());
-                        if let Err(e) = self.on_source_device_removed(device).await {
+                        if let Err(e) = self.on_source_device_removed(device, Some(source)).await {
                             log::error!("Failed to remove source device: {:?}", e);
                         }
                     }
                     CompositeCommand::SourceDeviceRemoved(device) => {
                         log::debug!("Detected source device removed: {}", device.path());
                         devices_removed = true;
-                        if let Err(e) = self.on_source_device_removed(device).await {
+                        if let Err(e) = self.on_source_device_removed(device, None).await {
                             log::error!("Failed to remove source device: {:?}", e);
                         }
                     }
@@ -671,7 +836,10 @@ impl CompositeDevice {
             }
 
             let source_tx = source_device.client();
-            self.source_devices.insert(device_id.clone(), source_tx);
+            self.source_devices
+                .insert(device_id.clone(), source_tx.clone());
+            let restore_id = device_id.clone();
+            let stopped_source = source_tx.clone();
             let tx = self.tx.clone();
             let device = source_device.get_device_ref().to_owned();
 
@@ -680,10 +848,23 @@ impl CompositeDevice {
                     log::error!("Failed running device {}: {:?}", device_id, e);
                 }
                 log::debug!("Source device closed");
-                if let Err(e) = tx.send(CompositeCommand::SourceDeviceStopped(device)).await {
+                if let Err(e) = tx
+                    .send(CompositeCommand::SourceDeviceStopped(
+                        device,
+                        stopped_source,
+                    ))
+                    .await
+                {
                     log::error!("Failed to send device stop command: {:?}", e);
                 }
             });
+            // Recreate definitions only; replaying old play requests could restart
+            // vibration after a disconnect without a new request from the client.
+            if let Some(capabilities) = self.output_capabilities_by_source.get(&restore_id) {
+                self.ff_effects
+                    .restore_source(&restore_id, &source_tx, capabilities)
+                    .await;
+            }
         }
         log::debug!("All source device tasks started");
         Ok(())
@@ -752,85 +933,26 @@ impl CompositeDevice {
         if let OutputEvent::Uinput(uinput) = event.borrow() {
             match uinput {
                 UinputOutputEvent::FFUpload(id, data, target_dev) => {
-                    // If this effect was already uploaded, just return the id
-                    // back to the target device and inform all source devices
-                    // to update the effect with the given data.
-                    if let Some(source_effect_ids) = self.ff_effect_id_source_map.get(id) {
-                        for (source_id, source_effect_id) in source_effect_ids.iter() {
-                            let Some(source) = self.source_devices.get(source_id) else {
-                                continue;
-                            };
-                            log::debug!("Updating effect {source_effect_id} from {source_id}");
-                            if let Err(e) = source.update_effect(*source_effect_id, *data).await {
-                                log::error!("Error updating effect '{id}' on {source_id}: {e:?}");
-                            }
-                        }
-                        target_dev.send(Some(*id))?;
-                        return Ok(());
-                    }
-
-                    // Upload the effect data to the source devices
-                    let mut source_effect_ids = HashMap::new();
-                    for (source_id, source) in self.source_devices.iter() {
-                        log::debug!("Uploading effect to {source_id}");
-                        match source.upload_effect(*data).await {
-                            Ok(source_effect_id) => {
-                                // An effect ID of -1 indicates the device does not support
-                                // FF events.
-                                if source_effect_id == -1 {
-                                    continue;
-                                }
-                                log::debug!("Successfully uploaded effect to {source_id} with source effect id {source_effect_id}");
-                                source_effect_ids.insert(source_id.clone(), source_effect_id);
-                            }
-                            Err(e) => {
-                                log::error!("Error uploading effect to {source_id}: {e:?}");
-                            }
-                        }
-                    }
-
-                    // If no source devices uploaded the effect, don't bother
-                    // allocating an effect id.
-                    if source_effect_ids.is_empty() {
-                        log::debug!("No source device available to handle FF effect");
-                        target_dev.send(None)?;
-                    }
-
-                    // If upload was successful, return an effect ID
-                    let id = self.ff_effect_ids.iter().next().copied();
-                    if let Some(id) = id {
-                        log::debug!("Uploaded effect with effect id {id}");
-                        self.ff_effect_ids.remove(&id);
-                        self.ff_effect_id_source_map.insert(id, source_effect_ids);
-                        target_dev.send(Some(id))?;
-                    } else {
-                        target_dev.send(None)?;
-                    }
+                    self.ff_effects
+                        .upload_and_reply(
+                            *id,
+                            *data,
+                            &self.source_devices,
+                            &self.output_capabilities_by_source,
+                            target_dev,
+                        )
+                        .await;
                 }
                 UinputOutputEvent::FFErase(effect_id) => {
                     let effect_id = *effect_id as i16;
-                    // Erase the effect from source devices
-                    if let Some(source_effect_ids) = self.ff_effect_id_source_map.get(&effect_id) {
-                        for (source_id, source_effect_id) in source_effect_ids.iter() {
-                            let Some(source) = self.source_devices.get(source_id) else {
-                                continue;
-                            };
-                            log::debug!("Erasing effect {effect_id} from {source_id}");
-                            if let Err(e) = source.erase_effect(*source_effect_id).await {
-                                log::warn!("Failed to erase FF effect from {source_id}: {:?}", e);
-                            }
-                        }
-                    }
-
-                    // Add the effect ID to list of available effect ids
-                    log::debug!("Erased effect with effect id {effect_id}");
-                    self.ff_effect_ids.insert(effect_id);
-                    self.ff_effect_id_source_map.remove(&effect_id);
+                    self.ff_effects
+                        .erase_effect(effect_id, &self.source_devices)
+                        .await;
                 }
             }
 
-            log::trace!("Available effect IDs: {:?}", self.ff_effect_ids);
-            log::debug!("Used effect IDs: {:?}", self.ff_effect_id_source_map);
+            log::trace!("Available effect IDs: {:?}", self.ff_effects.available_ids);
+            log::debug!("Used effect IDs: {:?}", self.ff_effects.effects);
 
             return Ok(());
         }
@@ -865,14 +987,13 @@ impl CompositeDevice {
                     // Lookup the source effect ids for the effect
                     let effect_id = input_event.code() as i16;
                     let value = input_event.value();
-                    let Some(source_effect_ids) = self.ff_effect_id_source_map.get(&effect_id)
-                    else {
+                    let Some(effect) = self.ff_effects.effects.get(&effect_id) else {
                         log::warn!("Received FF event with unknown id: {effect_id}");
                         continue;
                     };
 
                     // Lookup the source effect id for this source device
-                    let Some(source_effect_id) = source_effect_ids.get(source_id) else {
+                    let Some(source_effect_id) = effect.source_ids.get(source_id) else {
                         log::warn!("Unable to find source effect id for effect {effect_id} from {source_id}");
                         continue;
                     };
@@ -1588,30 +1709,25 @@ impl CompositeDevice {
     }
 
     /// Executed whenever a source device is removed from this [CompositeDevice]
-    async fn on_source_device_removed(&mut self, device: DeviceInfo) -> Result<(), Box<dyn Error>> {
+    async fn on_source_device_removed(
+        &mut self,
+        device: DeviceInfo,
+        stopped: Option<SourceDeviceClient>,
+    ) -> Result<(), Box<dyn Error>> {
         let path = device.path();
         let id = device.get_id();
 
-        // Remove any ffb effects this device registered
-        let mut freed_effect_ids = Vec::new();
-
-        // Loop through all registered effects and remove this device as a source
-        for (effect_id, source_map) in self.ff_effect_id_source_map.iter_mut() {
-            if source_map.remove(&id).is_some() {
-                log::debug!("Removed source {id} from effect {effect_id}");
-            }
-
-            // If this was the last user of the effect, stage the effect for removal
-            if source_map.is_empty() {
-                freed_effect_ids.push(*effect_id);
-            }
-        }
-
-        // Remove all previously staged effects
-        for effect_id in freed_effect_ids {
-            log::debug!("Freeing effect {effect_id} because last source was removed");
-            self.ff_effect_id_source_map.remove(&effect_id);
-            self.ff_effect_ids.insert(effect_id);
+        // Keep target effects reserved, but discard this physical incarnation.
+        if !detach_source(
+            &mut self.source_devices,
+            &mut self.ff_effects,
+            &id,
+            stopped.as_ref(),
+        )
+        .await
+        {
+            log::debug!("Ignoring completion of an obsolete source reader: {id}");
+            return Ok(());
         }
 
         // Remove tracked input capabilities

@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, error::Error, os::fd::AsFd, time::Duration};
 
 use evdev::{
@@ -24,9 +25,13 @@ use super::{InputError, OutputError, TargetInputDevice, TargetOutputDevice};
 // each other for chords.
 const MIN_CHORD_TIME: Duration = Duration::from_millis(80);
 
+#[cfg(test)]
+#[path = "xpad_test.rs"]
+mod tests;
+
 #[derive(Debug)]
 pub struct XBoxController {
-    device: VirtualDevice,
+    device: Arc<Mutex<VirtualDevice>>,
     axis_map: HashMap<AbsoluteAxisCode, AbsInfo>,
     queued_events: Vec<ScheduledNativeEvent>,
     capabilities: Vec<Capability>,
@@ -38,7 +43,7 @@ impl XBoxController {
         let device = XBoxController::create_virtual_device(&axis_map, model)?;
         let capabilities = get_model_capabilties(model);
         Ok(Self {
-            device,
+            device: Arc::new(Mutex::new(device)),
             axis_map,
             queued_events: Vec::new(),
             capabilities,
@@ -271,12 +276,18 @@ impl TargetInputDevice for XBoxController {
             let record =
                 NativeEvent::new(Capability::Keyboard(Keyboard::KeyRecord), event.get_value());
             let evdev_events = self.translate_event(record);
-            self.device.emit(evdev_events.as_slice())?;
+            self.device
+                .lock()
+                .map_err(|_| "Xbox device lock poisoned")?
+                .emit(evdev_events.as_slice())?;
             return Ok(());
         }
 
         let evdev_events = self.translate_event(event);
-        self.device.emit(evdev_events.as_slice())?;
+        self.device
+            .lock()
+            .map_err(|_| "Xbox device lock poisoned")?
+            .emit(evdev_events.as_slice())?;
         Ok(())
     }
 
@@ -319,7 +330,12 @@ impl TargetOutputDevice for XBoxController {
         composite_device: &Option<CompositeDeviceClient>,
     ) -> Result<Vec<OutputEvent>, OutputError> {
         // Fetch any force feedback events from the device
-        let events: Vec<InputEvent> = match self.device.fetch_events() {
+        let events: Vec<InputEvent> = match self
+            .device
+            .lock()
+            .map_err(|_| "Xbox device lock poisoned")?
+            .fetch_events()
+        {
             Ok(events) => events.collect(),
             Err(e) => match e.kind() {
                 std::io::ErrorKind::WouldBlock => vec![],
@@ -338,54 +354,68 @@ impl TargetOutputDevice for XBoxController {
             match event.destructure() {
                 EventSummary::UInput(event, UInputCode::UI_FF_UPLOAD, ..) => {
                     log::debug!("Got FF upload event");
-                    // Claim ownership of the FF upload and convert it to a FF_UPLOAD
-                    // event
-                    let mut event = self.device.process_ff_upload(event)?;
-                    let effect_id = event.effect_id();
-
-                    log::debug!("Upload effect: {:?} with id {}", event.effect(), effect_id);
-                    let Some(composite_device) = composite_device.clone() else {
-                        log::debug!("No composite device to upload effect to!");
-                        event.set_retval(-1);
-                        continue;
-                    };
-
-                    // Send the effect data to be uploaded to the device and wait
-                    // for an effect ID to be generated.
-                    let (tx, rx) = std::sync::mpsc::channel::<Option<i16>>();
-                    let upload = OutputEvent::Uinput(UinputOutputEvent::FFUpload(
-                        effect_id,
-                        event.effect(),
-                        tx,
-                    ));
+                    let device = self.device.clone();
+                    let composite_device = composite_device.clone();
+                    // Create and finish the upload guard on the worker. The guard
+                    // contains raw FF union pointers and cannot cross threads.
+                    // Release the device lock before waiting for a composite reply.
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = composite_device.blocking_process_output_event(upload) {
-                            log::error!("Failed to send ff upload to composite device: {e}");
+                        let mut event = {
+                            let Ok(mut device) = device.lock() else {
+                                log::error!("Xbox device lock poisoned during FF upload");
+                                return;
+                            };
+                            match device.process_ff_upload(event) {
+                                Ok(event) => event,
+                                Err(e) => {
+                                    log::error!("Failed to begin FF upload: {e}");
+                                    return;
+                                }
+                            }
+                        };
+                        let Some(composite_device) = composite_device else {
+                            event.set_retval(-1);
+                            return;
+                        };
+                        let (tx, rx) = std::sync::mpsc::channel::<Option<i16>>();
+                        let upload = OutputEvent::Uinput(UinputOutputEvent::FFUpload(
+                            event.effect_id(),
+                            event.effect(),
+                            tx,
+                        ));
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = composite_device.blocking_process_output_event(upload) {
+                                log::error!("Failed to send ff upload to composite device: {e}");
+                            }
+                        });
+                        let effect_id = match rx.recv_timeout(Duration::from_secs(1)) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                event.set_retval(-1);
+                                log::error!("Failed to receive FF upload response: {e:?}");
+                                return;
+                            }
+                        };
+
+                        // Dropping the guard acknowledges the upload to the kernel.
+                        if let Some(id) = effect_id {
+                            event.set_effect_id(id);
+                            event.set_retval(0);
+                        } else {
+                            log::warn!("Failed to get effect ID to upload FF effect");
+                            event.set_retval(-1);
                         }
                     });
-                    let effect_id = match rx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            event.set_retval(-1);
-                            log::error!("Failed to receive FF upload response: {e:?}");
-                            continue;
-                        }
-                    };
-
-                    // Set the effect ID for the FF effect
-                    if let Some(id) = effect_id {
-                        event.set_effect_id(id);
-                        event.set_retval(0);
-                    } else {
-                        log::warn!("Failed to get effect ID to upload FF effect");
-                        event.set_retval(-1);
-                    }
                 }
                 EventSummary::UInput(event, UInputCode::UI_FF_ERASE, ..) => {
                     log::debug!("Got FF erase event");
                     // Claim ownership of the FF erase event and convert it to a FF_ERASE
                     // event.
-                    let event = self.device.process_ff_erase(event)?;
+                    let event = self
+                        .device
+                        .lock()
+                        .map_err(|_| "Xbox device lock poisoned")?
+                        .process_ff_erase(event)?;
                     log::debug!("Erase effect: {:?}", event.effect_id());
 
                     let erase = OutputEvent::Uinput(UinputOutputEvent::FFErase(event.effect_id()));

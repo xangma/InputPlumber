@@ -1,4 +1,7 @@
-use std::{sync::mpsc::channel, time::Duration};
+use std::{
+    sync::mpsc::{channel, RecvTimeoutError},
+    time::Duration,
+};
 
 use evdev::FFEffectData;
 use thiserror::Error;
@@ -22,7 +25,7 @@ pub enum ClientError {
     SendError(SendError<SourceCommand>),
     #[error("failed to try to send command to device")]
     TrySendError(TrySendError<SourceCommand>),
-    #[error("service encountered an error processing the request")]
+    #[error("service encountered an error processing the request: {0}")]
     ServiceError(Box<dyn std::error::Error + Send + Sync>),
     #[error("device no longer exists")]
     ChannelClosed,
@@ -57,6 +60,10 @@ impl SourceDeviceClient {
         Self { tx }
     }
 
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
     /// Send the given command to the source device. This method uses a timeout
     /// to detect potential deadlocks.
     async fn send(&self, cmd: SourceCommand) -> Result<(), ClientError> {
@@ -86,12 +93,21 @@ impl SourceDeviceClient {
     pub async fn upload_effect(&self, effect: FFEffectData) -> Result<i16, ClientError> {
         let (tx, rx) = channel();
         self.tx.try_send(SourceCommand::UploadEffect(effect, tx))?;
-        match rx.recv_timeout(Duration::from_millis(200)) {
+        // Source startup itself is a Tokio task. A synchronous receive here
+        // can keep that task from starting immediately after a reconnect.
+        let response =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_millis(200)))
+                .await
+                .map_err(|err| ClientError::ServiceError(err.into()))?;
+        match response {
             Ok(result) => match result {
                 Ok(id) => Ok(id),
                 Err(err) => Err(ClientError::ServiceError(err)),
             },
-            Err(_err) => Err(ClientError::ChannelClosed),
+            Err(RecvTimeoutError::Timeout) => Err(ClientError::ServiceError(
+                "Timed out after 200ms waiting for force feedback upload response".into(),
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(ClientError::ChannelClosed),
         }
     }
 
@@ -141,5 +157,69 @@ impl SourceDeviceClient {
     pub async fn stop(&self) -> Result<(), ClientError> {
         self.tx.send(SourceCommand::Stop).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::evdev::{FFEffectKind, FFReplay, FFTrigger};
+
+    fn effect() -> FFEffectData {
+        FFEffectData {
+            direction: 0,
+            trigger: FFTrigger {
+                button: 0,
+                interval: 0,
+            },
+            replay: FFReplay {
+                length: 1000,
+                delay: 0,
+            },
+            kind: FFEffectKind::Rumble {
+                strong_magnitude: 100,
+                weak_magnitude: 0,
+            },
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_wait_allows_a_new_source_task_to_start() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let source = tokio::spawn(async move {
+            let Some(SourceCommand::UploadEffect(_, reply)) = rx.recv().await else {
+                panic!("Expected an FF upload request");
+            };
+            let _ = reply.send(Ok(7));
+        });
+        let client = SourceDeviceClient::new(tx);
+        assert_eq!(client.upload_effect(effect()).await.unwrap(), 7);
+        source.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_timeout_is_distinct_from_a_disconnected_source() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let client = SourceDeviceClient::new(tx);
+        let error = client.upload_effect(effect()).await.unwrap_err();
+        assert!(matches!(&error, ClientError::ServiceError(_)));
+        assert!(error.to_string().contains("Timed out after 200ms"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_upload_response_reports_channel_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let source = tokio::spawn(async move {
+            let Some(SourceCommand::UploadEffect(_, reply)) = rx.recv().await else {
+                panic!("Expected an FF upload request");
+            };
+            drop(reply);
+        });
+        let client = SourceDeviceClient::new(tx);
+        assert!(matches!(
+            client.upload_effect(effect()).await,
+            Err(ClientError::ChannelClosed)
+        ));
+        source.await.unwrap();
     }
 }

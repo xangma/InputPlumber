@@ -491,15 +491,22 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
             match rx.try_recv() {
                 Ok(cmd) => match cmd {
                     SourceCommand::UploadEffect(data, composite_dev) => {
-                        let res = match implementation.upload_effect(data) {
-                            Ok(id) => composite_dev.send(Ok(id)),
+                        let (res, uploaded_id) = match implementation.upload_effect(data) {
+                            Ok(id) => (composite_dev.send(Ok(id)), Some(id)),
                             Err(e) => {
                                 let err = format!("Failed to upload effect: {:?}", e);
-                                composite_dev.send(Err(err.into()))
+                                (composite_dev.send(Err(err.into())), None)
                             }
                         };
                         if let Err(err) = res {
-                            log::error!("Failed to send upload result: {:?}", err);
+                            // The caller may have timed out while the source was
+                            // busy. It cannot erase an effect whose ID it never got.
+                            if let Some(id) = uploaded_id.filter(|id| *id >= 0) {
+                                if let Err(e) = implementation.erase_effect(id) {
+                                    log::warn!("Failed to erase abandoned FF effect {id}: {e}");
+                                }
+                            }
+                            log::debug!("FF upload caller disappeared: {err}");
                         }
                     }
                     SourceCommand::UpdateEffect(effect_id, data) => {
@@ -721,5 +728,71 @@ impl SourceDevice {
             SourceDevice::Led(device) => device.get_device_path(),
             SourceDevice::Tty(device) => device.get_device_path(),
         }
+    }
+}
+
+#[cfg(test)]
+mod ff_upload_tests {
+    use super::*;
+    use ::evdev::{FFEffectKind, FFReplay, FFTrigger};
+
+    struct MockSource {
+        uploaded: bool,
+        erased: Vec<i16>,
+    }
+
+    impl SourceInputDevice for MockSource {
+        fn poll(&mut self) -> Result<Vec<NativeEvent>, InputError> {
+            Ok(vec![])
+        }
+
+        fn get_capabilities(&self) -> Result<Vec<Capability>, InputError> {
+            Ok(vec![])
+        }
+    }
+
+    impl SourceOutputDevice for MockSource {
+        fn upload_effect(&mut self, _data: FFEffectData) -> Result<i16, OutputError> {
+            self.uploaded = true;
+            Ok(7)
+        }
+
+        fn erase_effect(&mut self, id: i16) -> Result<(), OutputError> {
+            self.uploaded = false;
+            self.erased.push(id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn abandoned_upload_response_frees_the_new_physical_effect() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (reply, response) = std::sync::mpsc::channel();
+        drop(response);
+        let data = FFEffectData {
+            direction: 0,
+            trigger: FFTrigger {
+                button: 0,
+                interval: 0,
+            },
+            replay: FFReplay {
+                length: 1000,
+                delay: 0,
+            },
+            kind: FFEffectKind::Rumble {
+                strong_magnitude: 100,
+                weak_magnitude: 0,
+            },
+        };
+        tx.try_send(SourceCommand::UploadEffect(data, reply))
+            .unwrap();
+        let implementation = Mutex::new(MockSource {
+            uploaded: false,
+            erased: vec![],
+        });
+        let mut implementation = implementation.lock().unwrap();
+        SourceDriver::receive_commands(&mut rx, &mut implementation, &mut HashSet::new()).unwrap();
+        assert!(!implementation.uploaded);
+        assert_eq!(implementation.erased, vec![7]);
     }
 }
