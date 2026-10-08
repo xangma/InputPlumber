@@ -10,6 +10,7 @@ use crate::{
         info::DeviceInfo,
         output_capability::OutputCapability,
         output_event::OutputEvent,
+        source::client::SourceDeviceClient,
         target::{client::TargetDeviceClient, TargetDeviceTypeId},
     },
 };
@@ -50,7 +51,7 @@ pub enum CompositeCommand {
     SetForceFeedbackEnabled(bool),
     SourceDeviceAdded(DeviceInfo),
     SourceDeviceRemoved(DeviceInfo),
-    SourceDeviceStopped(DeviceInfo),
+    SourceDeviceStopped(DeviceInfo, SourceDeviceClient),
     #[allow(dead_code)]
     UpdateSourceCapabilities(String, HashSet<Capability>),
     UpdateTargetCapabilities(String, HashSet<Capability>),
